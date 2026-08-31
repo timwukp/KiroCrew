@@ -10,7 +10,15 @@ booleans and non-integral, malformed, or non-finite values. Imported settings ar
 type-validated before they are written, and the CLI converts typed values before
 writing.
 
-The config module (`kiro_crew/config/loader.py`) loads runtime configuration from `~/.kiro/crew/config.json` using stdlib dataclasses with sensible defaults.
+The config package loads runtime configuration from `~/.kiro/crew/config.json`
+using stdlib dataclasses with sensible defaults. Responsibilities are split in
+one direction: `config/sections.py` owns section DTOs, field defaults, and their
+coercion/normalization rules; `config/resolution.py` owns raw overlay merging,
+top-level section classification, and degraded-input tracking; and
+`config/loader.py` owns the compatibility facade plus persistence, validation
+orchestration, cache fingerprinting, migration, and runtime binding resolution.
+`loader.py` re-exports the historical DTO, helper, and constant names so existing
+callers keep the same import surface.
 
 A feature whose section spends tokens on the user's behalf defaults to off and
 documents its knobs in its own spec — `session_summary` is the current example
@@ -803,7 +811,7 @@ class TelegramConfig:
     allow_forum: bool = False          # serve supergroup forum Topics as per-Topic sessions (Slack-thread style). Fail-closed: also requires the supergroup's chat_id in allowed_forum_chat_ids, and only real Topics (message_thread_id present) are served — ordinary groups and the supergroup General chat are denied
     allowed_forum_chat_ids: list[int] = []  # numeric supergroup chat_ids permitted to run forum-topic sessions; empty = deny all groups (fail closed)
 
-# Additional top-level DTOs (not fully expanded here — see loader.py):
+# Additional top-level DTOs (not fully expanded here — see sections.py):
 # OrchestratorConfig, CronHistoryConfig, TunnelConfig, InstancesConfig, HeartbeatConfig,
 # WorkspaceConfig, MemoryStoreConfig, ExternalRegistryConfig,
 # KiroCrewAgentConfig, SlackConfig.
@@ -897,7 +905,8 @@ screenshot.
 ### Security-Bounded Config Clamp
 
 Resource-limit and timeout knobs are clamped to hard ceilings **at load time**, not
-just at the dashboard write gate. The ceilings are the single source of truth in
+just at the dashboard write gate. The ceilings are owned beside the field models
+in `sections.py` and re-exported by `loader.py`; the load-time clamp remains in
 `loader.py`:
 
 | Constant | Value | Field |
