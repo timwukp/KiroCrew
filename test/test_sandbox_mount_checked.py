@@ -282,7 +282,7 @@ def test_the_refusal_names_the_deliberate_opt_out(tmp_path: Path) -> None:
     assert "sandbox_level" in refusal
 
 
-def test_every_tier_routes_all_six_mounts_through_the_guard() -> None:
+def test_every_tier_routes_all_seven_mounts_through_the_guard() -> None:
     """No tier may keep a raw, unchecked ``_libc.mount`` call site.
 
     Break-arm: ``reintroduce_raw`` (one site reverted to the raw call).
@@ -296,7 +296,9 @@ def test_every_tier_routes_all_six_mounts_through_the_guard() -> None:
             if "_libc.mount(" in line and "source, target, None, flags, None" not in line
         ]
         assert raw == [], f"{level}: unchecked mount call(s): {raw}"
-        assert script.count("_mount_or_die(") == 7  # 1 def + 6 call sites
+        # 1 def + 7 call sites: /, per-dir credential masks, the two READONLY_DIRS
+        # steps, per-file masks, .ssh, and the data-home container self-bind.
+        assert script.count("_mount_or_die(") == 8
 
 
 # --------------------------------------------------------------------------
