@@ -4040,6 +4040,73 @@ class TestTheCacheIsHiddenFromAgentSubprocesses:
 
         assert sandbox._POLICY_CACHE_LEAF == pd.CACHE_DIR_LEAF
 
+    _KEYSTONE_LEAVES = (
+        "security_policy.json",
+        "admission_policy.json",
+        "computer_use.json",
+        "denied_commands.json",
+        "profiles",
+        "token_signing.key",
+    )
+
+    def test_the_keystone_leaf_list_matches_the_module_constant(self):
+        """The launcher's ``_KEYSTONE_LEAVES`` feeds the relocated-home mask directly, so
+        pin it here too: a leaf added to the module but not to this test's expectations
+        (or vice-versa) is the drift this class exists to catch."""
+        from kiro_crew import sandbox
+
+        assert tuple(sandbox._KEYSTONE_LEAVES) == self._KEYSTONE_LEAVES
+
+    def test_the_sel_trust_root_is_deliberately_outside_this_mask(self):
+        """The SEL signing key is NOT masked, and that is a decision rather than an
+        oversight — pinned so re-adding it has to argue with the reason.
+
+        An empty inode is the wrong substitute for a signing key in both directions.
+        Masking the DIRECTORY (``trust``, where the live key is) leaves a sandboxed Kiro
+        Crew child no key in the overlay: it mints a fresh one and appends to the
+        still-visible ``security_events.jsonl`` with it, so the gateway reports an HMAC
+        mismatch on a log nobody tampered with. Masking the pre-migration KEY FILE
+        (``sel_hmac.key``) hits ``sel``'s deliberate fail-hard on a short key, turning the
+        0-byte overlay into a ``RuntimeError`` out of ``SecurityEventLog()``. Both stay
+        covered by the in-process gate, which is where the key's protection lives.
+        """
+        from kiro_crew import sandbox, sel
+
+        assert sel._TRUST_SUBDIR not in sandbox._KEYSTONE_LEAVES
+        assert sel._HMAC_KEY_FILE not in sandbox._KEYSTONE_LEAVES
+        for dirs in (sandbox._STRICT_DIRS, sandbox._STANDARD_DIRS, sandbox._CC_DIRS):
+            for prefix in (".kiro/crew", ".kirocrew"):
+                assert f"{prefix}/{sel._TRUST_SUBDIR}" not in dirs
+                assert f"{prefix}/{sel._HMAC_KEY_FILE}" not in dirs
+        # The in-process gate is what covers it, in both spellings.
+        assert sel._TRUST_SUBDIR in security._CREW_SECRET_LEAVES
+        assert sel._HMAC_KEY_FILE in security._CREW_SECRET_LEAVES
+
+    @pytest.mark.parametrize("leaf", _KEYSTONE_LEAVES)
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    def test_every_sandbox_tier_masks_the_governance_keystone(self, prefix, leaf):
+        """A spawned OS subprocess bypasses ``is_sensitive_path``, so the keystone must
+        be bind-mount-hidden in every sandbox tier — which closes the read AND the write
+        path, because a bind-mount of an empty inode over the target hides the real file
+        from both directions.
+
+        Each leaf is pinned to be a MEMBER of ``security._CREW_SECRET_LEAVES`` (the
+        in-process gate's source of truth) so a leaf here cannot drift away from the
+        security floor. Deliberately a subset pin, not an equality one: that list also
+        carries record-of-history and scheduling leaves this mask does not cover.
+        """
+        from kiro_crew import sandbox
+
+        assert leaf in security._CREW_SECRET_LEAVES
+
+        entry = f"{prefix}/{leaf}"
+        for name, dirs in (
+            ("strict", sandbox._STRICT_DIRS),
+            ("standard", sandbox._STANDARD_DIRS),
+            ("cc", sandbox._CC_DIRS),
+        ):
+            assert entry in dirs, f"{entry} is not hidden in the {name} sandbox tier"
+
     def test_a_relocated_data_home_is_masked_by_its_resolved_path(self, monkeypatch, tmp_path):
         """Those entries are ``$HOME``-relative, and ``KIROCREW_HOME`` moves the cache.
 
@@ -4106,6 +4173,34 @@ class TestTheCacheIsHiddenFromAgentSubprocesses:
         assert extra == [os.path.normpath(str(real / ".kiro" / "crew" / pd.CACHE_DIR_LEAF))]
         # And the $HOME-relative spelling is still covered by the dir lists themselves.
         assert f".kiro/crew/{pd.CACHE_DIR_LEAF}" in sandbox._STANDARD_DIRS
+
+    def test_a_relocated_data_home_masks_the_keystone_by_its_resolved_path(
+        self, monkeypatch, tmp_path
+    ):
+        """The keystone entries are ``$HOME``-relative too, so ``KIROCREW_HOME`` moves the
+        ceiling out from under them. The keystone must not inherit that limitation any more
+        than the cache does: these ARE the ceiling documents and signing keys, and the
+        in-process gate already re-anchors the same leaves under the resolved
+        ``KIROCREW_HOME`` (``security._home_dir_targets_uncached``) — the OS-sandbox mask
+        has to match.
+        """
+        from kiro_crew import sandbox
+
+        relocated = tmp_path / "relocated-home"
+        monkeypatch.setenv("KIROCREW_HOME", str(relocated))
+        masked = sandbox._relocated_keystone_dirs()
+        assert masked == [os.path.realpath(relocated / leaf) for leaf in sandbox._KEYSTONE_LEAVES]
+
+    def test_the_default_layout_adds_no_duplicate_keystone_rule(self, monkeypatch, tmp_path):
+        """On the default layout the ``$HOME``-relative entries already cover the keystone,
+        so ``normpath`` de-duplication yields nothing — the same contract the cache holds."""
+        from kiro_crew import sandbox
+
+        home = tmp_path / "home"
+        (home / ".kiro" / "crew").mkdir(parents=True)
+        monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: home))
+        monkeypatch.setenv("KIROCREW_HOME", str(home / ".kiro" / "crew"))
+        assert sandbox._relocated_keystone_dirs() == []
 
 
 @pytest.mark.skipif(
@@ -4211,6 +4306,96 @@ class TestAnExposedCacheIsStillReadOnly:
         assert not sandbox._is_policy_cache_dir("/home/u/.kiro/crew")
         assert not sandbox._is_policy_cache_dir("/home/u/.kiro/crew/policy_cache_backup")
         assert sandbox._is_policy_cache_dir("/home/u/.kiro/crew/policy_cache/")
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "asserts on the Linux namespace launcher and the macOS seatbelt profile, neither "
+        "of which Windows has -- and ``_build_launcher_script`` calls POSIX-only "
+        "os.getuid. Guarded rather than listed in windows-expected-failures.txt: that "
+        "list is a burn-down backlog, and an OS sandbox Windows does not implement is a "
+        "permanent boundary."
+    ),
+)
+class TestTheGeneratedMaskCoversTheKeystone:
+    """List membership is necessary but not sufficient: a refactor of how the tier lists
+    feed the child loops (or the seatbelt rule builder) could pass the membership tests
+    while dropping a leaf from the actual output. These pin the BEHAVIOUR — the generated
+    launcher script and seatbelt profile — for each keystone leaf under both prefixes.
+    """
+
+    @staticmethod
+    def _leaf_path(prefix, leaf):
+        from pathlib import Path as _Path
+
+        return str(_Path.home() / prefix / leaf)
+
+    @pytest.mark.parametrize("leaf", TestTheCacheIsHiddenFromAgentSubprocesses._KEYSTONE_LEAVES)
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    @pytest.mark.parametrize("level", ["standard", "cc", "strict"])
+    def test_the_linux_launcher_hides_every_keystone_leaf(self, level, prefix, leaf):
+        """The child gets the leaf in BOTH its dir and its file list (it classifies each
+        with its own isdir/isfile), and never in READONLY_DIRS — a bind-mount of an empty
+        inode over the target closes read AND write, unlike the read-only cache exposure."""
+        from kiro_crew import sandbox
+
+        path = self._leaf_path(prefix, leaf)
+        script = sandbox._build_launcher_script(level)
+        hidden = json.loads(script.split("SENSITIVE_DIRS = ", 1)[1].split("\n", 1)[0])
+        files = json.loads(script.split("SENSITIVE_FILES = ", 1)[1].split("\n", 1)[0])
+        readonly = json.loads(script.split("READONLY_DIRS = ", 1)[1].split("\n", 1)[0])
+
+        assert path in hidden, f"{path} is not bind-mount-hidden in the {level} launcher"
+        assert path in files, f"{path} is not in the {level} launcher file list"
+        assert path not in readonly, "the keystone is fully hidden, never merely read-only"
+
+    @pytest.mark.parametrize("leaf", TestTheCacheIsHiddenFromAgentSubprocesses._KEYSTONE_LEAVES)
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    @pytest.mark.parametrize("level", ["standard", "cc", "strict"])
+    def test_macos_denies_read_and_write_for_every_keystone_leaf(self, level, prefix, leaf):
+        """On macOS the read deny alone leaves the write direction open — the more serious
+        half, since rewriting ``security_policy.json`` or a signing key is a ceiling change.
+        The profile has to carry an independent ``file-write*`` deny as well as the read and
+        link denies, mirroring the cache/voice-runtime execution roots."""
+        from kiro_crew import sandbox
+
+        path = self._leaf_path(prefix, leaf)
+        profile = sandbox._build_seatbelt_profile(level)
+
+        assert f'(deny file-read* (subpath "{path}"))' in profile
+        assert f'(deny file-write* (subpath "{path}"))' in profile
+        assert f'(deny file-link (subpath "{path}"))' in profile
+
+    def test_a_credential_dir_gets_no_blanket_write_deny(self):
+        """The macOS keystone write deny stays scoped to the keystone leaves: widening it
+        to a credential dir such as ``.aws`` would break a tool legitimately refreshing a
+        cached token, exactly as the cache write-deny is kept scoped."""
+        from pathlib import Path as _Path
+
+        from kiro_crew import sandbox
+
+        aws = str(_Path.home() / ".aws")
+        profile = sandbox._build_seatbelt_profile("strict")
+        assert f'(deny file-read* (subpath "{aws}"))' in profile
+        assert f'(deny file-write* (subpath "{aws}"))' not in profile
+
+    def test_a_relocated_home_is_masked_in_both_backends(self, monkeypatch, tmp_path):
+        """The relocated resolved paths reach the generated launcher and seatbelt output,
+        not just ``_relocated_keystone_dirs`` in isolation — closing the relocation hole
+        the review flagged for the keystone the same way the cache already closes it."""
+        from kiro_crew import sandbox
+
+        relocated = tmp_path / "relocated-home"
+        monkeypatch.setenv("KIROCREW_HOME", str(relocated))
+        resolved = [os.path.realpath(relocated / leaf) for leaf in sandbox._KEYSTONE_LEAVES]
+
+        script = sandbox._build_launcher_script("standard")
+        hidden = json.loads(script.split("SENSITIVE_DIRS = ", 1)[1].split("\n", 1)[0])
+        profile = sandbox._build_seatbelt_profile("standard")
+        for path in resolved:
+            assert path in hidden, f"relocated {path} is not hidden in the launcher"
+            assert f'(deny file-write* (subpath "{path}"))' in profile
 
 
 class TestAnUnverifiableSourceIsTreatedAsWritable:
