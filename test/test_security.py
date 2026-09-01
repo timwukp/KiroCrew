@@ -6997,6 +6997,80 @@ class TestRedactAndTruncate:
         assert "AKIA" not in result
 
 
+class TestSELEmittersRedactBeforeTruncate:
+    """SEL metadata emitters must redact BEFORE truncating (issue #7501).
+
+    Two emitters previously sliced to 200 chars before redacting, so a
+    credential straddling the 200-char boundary was written to the durable
+    audit event with its tail cut off, which the credential regex could no
+    longer match. Each test plants the 20-char AWS access key ID
+    'AKIAIOSFODNN7EXAMPLE' straddling index 200 and asserts no fragment of it
+    (its 'AKIA' prefix) survives in the emitted event's metadata.
+    """
+
+    SECRET = "AKIAIOSFODNN7EXAMPLE"  # 20-char AWS access key ID
+
+    def test_push_allow_event_redacts_straddling_secret(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew import security
+
+        logged: list = []
+
+        class _RecorderLog:
+            def log(self, event: object) -> None:
+                logged.append(event)
+
+        monkeypatch.setattr(security, "SecurityEventLog", lambda: _RecorderLog())
+
+        # Build a push command whose token starts a few chars before index 200
+        # so the 20-char key straddles the 200-char cut, and the total length
+        # exceeds 200 chars.
+        prefix = "git push https://x:"
+        pad = "a" * (200 - len(prefix) - 4)
+        command = prefix + pad + self.SECRET + "@github.com/o/r " + "y" * 300
+        assert len(command) > 200
+        assert 200 - len(prefix + pad) < len(self.SECRET)  # key straddles the cut
+
+        security._emit_push_allow_event(command)
+
+        assert len(logged) == 1
+        event = logged[0]
+        assert event.event_type == "push_allowed"
+        assert not any("AKIA" in str(value) for value in event.metadata.values()), event.metadata
+
+    def test_injection_dropped_event_redacts_straddling_secret(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew import security
+
+        logged: list = []
+
+        class _RecorderLog:
+            def log(self, event: object) -> None:
+                logged.append(event)
+
+        monkeypatch.setattr(security, "SecurityEventLog", lambda: _RecorderLog())
+
+        pad = "p" * (200 - 4)
+        sample = pad + self.SECRET + " " + "z" * 300
+        assert len(sample) > 200
+        assert 200 - len(pad) < len(self.SECRET)  # key straddles the cut
+
+        security.audit_injection_dropped(
+            surface="slack",
+            session_key="k",
+            channel_id="C",
+            thread_ts="1",
+            sample=sample,
+        )
+
+        assert len(logged) == 1
+        event = logged[0]
+        assert event.event_type == "prompt_injection_dropped"
+        assert not any("AKIA" in str(value) for value in event.metadata.values()), event.metadata
+
+
 class TestScanHistory:
     """Tests for scan_history()."""
 

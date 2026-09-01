@@ -5219,7 +5219,7 @@ def _emit_push_allow_event(command: str) -> None:
                 outcome="allowed",
                 resources="feature_branch_push",
                 metadata={
-                    "command": command[:200],
+                    "command": redact_and_truncate(command, 200),
                     "mechanism": "BRANCH_GATE",
                 },
             )
@@ -12258,7 +12258,7 @@ def audit_injection_dropped(
                     "surface": surface,
                     "channel_id": channel_id,
                     "thread_ts": thread_ts,
-                    "sample": sample[:200] if sample else "",
+                    "sample": redact_and_truncate(sample, 200),
                     "mechanism": "contains_injection",
                 },
             )
