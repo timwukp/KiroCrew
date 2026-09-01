@@ -2406,6 +2406,13 @@ async def _reset_slot_session(
     microseconds ago, which cannot have posted a card yet.
     """
     _unblock_pending_waits(state, slot)
+    # The withhold verdict describes the session that advertised the model list,
+    # not the slot, so it goes with the session. Routed through this one funnel
+    # for the reason above: the switch handlers that reset a session are exactly
+    # the ones that can change which models the next session will advertise
+    # (agent, workspace, and the model pick itself), and a verdict surviving that
+    # would label the new session from the old one's entitlement.
+    slot.record_model_withheld(None)
     return await state.sessions.reset(session_key, skip_if_busy=skip_if_busy)
 
 
