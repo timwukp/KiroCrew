@@ -74,7 +74,7 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -1354,19 +1354,45 @@ def _unlisted_files(batch: Path) -> list[Path]:
     return unlisted
 
 
-def _discard_restored_batch(batch: Path, header: dict[str, Any]) -> None:
+def _identity_of(path: Path) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` for *path*, or None if it cannot be read.
+
+    Links are not followed: the question is what this NAME holds, never what it points at.
+    Taken so a later removal can be bound to the directory the caller was actually looking
+    at - see :func:`_remove_emptied_batch` for why a pinned walk alone does not establish
+    that.
+    """
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def _discard_restored_batch(batch: Path) -> None:
     """Remove a fully-restored batch, unless it holds files nothing listed.
 
     Deleting the directory wholesale would destroy an interrupted move's staged
     files — on the one path that exists to be safe. Those keep the batch alive
     instead, so a user can still see it and decide.
+
+    The caller has already cleared the manifest's entries, so nothing here writes: a batch
+    this declines to remove is one that stays exactly as it was found. That is deliberate
+    rather than incidental. Every refusal below is evidence about the PATH - a swapped
+    ancestor, an identity that could not be read, a platform with no descriptor to bind to -
+    and ``atomic_write`` REPLACES its destination, so a tidying write to that same path
+    would answer evidence of a swap by writing through it.
     """
+    # BEFORE the scan below, which is the point: the leftover scan is what establishes that
+    # this directory holds nothing worth keeping, so the removal has to be bound to the
+    # directory the scan actually walked. Taken after it, the identity could already be a
+    # substitute's.
+    identity = _identity_of(batch)
     try:
         leftovers = _unlisted_files(batch)
     except SessionStorageError as exc:
         # Not knowing is treated exactly like finding leftovers: keep the batch.
         logger.warning("keeping trash batch %r: %s", batch.name, exc)
-        _rewrite_manifest(batch, header, [])
         return
     if leftovers:
         logger.warning(
@@ -1375,9 +1401,213 @@ def _discard_restored_batch(batch: Path, header: dict[str, Any]) -> None:
             batch.name,
             len(leftovers),
         )
-        _rewrite_manifest(batch, header, [])
         return
-    shutil.rmtree(batch, ignore_errors=True)
+    _remove_emptied_batch(batch, "the restored batch", expect=identity)
+
+
+def _approve_emptied_batch(
+    batch: Path,
+    root_fd: int,
+    tree: pinned_fs.PinnedTree,
+) -> str | None:
+    """Re-ask "is this the batch, and does it hold anything unlisted" of a DESCRIPTOR.
+
+    The trash-specific half of :func:`_remove_emptied_batch`, passed to ``pinned_fs`` as its
+    approval hook. Both questions were already answered by path before the removal was
+    reached - which is exactly the answer that cannot be relied on, because resolving the
+    batch's parent FOLLOWS an ancestor that is already a symbolic link. Pinning the walk
+    then reaches the link's target faithfully, and the removal would empty that.
+
+    So the two questions are asked again here, of the descriptor the removal will actually
+    address, from ONE read of ONE file:
+
+    * the pinned root must BE the directory the caller was looking at, compared by
+      ``(st_dev, st_ino)`` against an identity the caller captured before its own by-path
+      read - at the batch's creation on one path, before the leftover scan on the other.
+      This is the check that makes the rest sound. Without it the only thing standing
+      between a swapped ancestor and a deletion is whether the directory the link points at
+      can produce a convincing manifest, and a tree an actor can write to can: they plant a
+      header naming this batch and a listing covering its contents, and every other question
+      here answers yes about the wrong directory. An inode cannot be forged by writing files.
+    * the manifest is opened through ``root_fd``, its inode is checked on the OPEN handle
+      against the one the scan recorded, and its header must claim THIS batch's
+      directory name. The header is the link back to the caller's own selection: a directory
+      substituted for the batch brings its own contents, and a directory that is not a
+      trash batch at all brings none - neither can produce a header naming this name.
+      :func:`_header_names_this_batch` is the same check the approval on the delete path
+      makes, for the same reason.
+    * NOTHING but the manifest may remain. Not "nothing unlisted" - nothing at all. Both
+      callers reach here only when the batch should already be empty of files: the restore
+      path has MOVED every listed file back out, and the staging path has a manifest with no
+      entries at all. So a file at a listed path is not the listed file; it is something that
+      arrived at that name afterwards, and it may be the only copy of whatever it is.
+      Consulting the listing here would authorise deleting exactly that, on the strength of a
+      name the manifest happens to mention. The stricter rule also needs no listing, which is
+      why the entries this read produced are discarded.
+
+    ONE read, not two, and that is the load-bearing part rather than an efficiency note.
+    Asking :func:`_summarize_manifest` for the header and :func:`_manifest_rels` for a listing
+    opens the file TWICE, and a manifest replaced in between passes the header check on the
+    first file while the second answers for another. The header now comes from one handle
+    whose inode was verified on that same handle, so there is no interval for a replacement to
+    land in.
+
+    Returns None to allow the removal, or a reason code to withhold it. The identity
+    comparison against the caller's recorded inode happens BEFORE this, in
+    :func:`_remove_emptied_batch`'s own hook -- it owns that answer because the caller also
+    needs to know whether the path was verified, and a reason code cannot carry that.
+
+    Links are not part of the second question. A symbolic link holds no data, and the
+    delete path removes scanned links for that reason; treating one as unlisted content
+    would strand a batch nothing can empty.
+    """
+    scanned_ino = tree.files.get((MANIFEST_NAME,))
+    if scanned_ino is None:
+        # Nothing here vouches for this being the selected batch, and `list_trash` would not
+        # offer a batch with no manifest either.
+        logger.warning("keeping trash batch %r: it has no manifest to identify it", batch.name)
+        return SKIP_UNREADABLE
+    parsed = _read_manifest(batch, dir_fd=root_fd, expect_ino=scanned_ino)
+    if parsed is None:
+        logger.warning(
+            "keeping trash batch %r: its manifest is not readable as the file that was scanned",
+            batch.name,
+        )
+        return SKIP_UNREADABLE
+    header, _entries = parsed
+    # `_header_names_this_batch` takes a `_summarize_manifest` triple; it consults only the
+    # header, and handing it the one this read already produced is what keeps this to one
+    # open.
+    if not _header_names_this_batch((header, 0, 0), batch.name):
+        return SKIP_IDENTITY_CHANGED
+    for key in tree.files:
+        if key == (MANIFEST_NAME,):
+            continue
+        logger.warning(
+            "keeping trash batch %r: it still holds %r, which nothing here may remove",
+            batch.name,
+            "/".join(key),
+        )
+        return SKIP_UNLISTED_FILES
+    return None
+
+
+def _remove_emptied_batch(batch: Path, what: str, *, expect: tuple[int, int] | None) -> bool:
+    """Remove a batch that holds nothing worth keeping, by descriptor rather than by name.
+
+    Both callers reach this having already established that the batch holds no file the
+    manifest does not list - a fully restored batch, and one no session was staged into.
+    What is left is the removal, and it used to be ``shutil.rmtree(batch)``: a PATH, which
+    the kernel re-resolves component by component. The trash root and the directories above
+    it are writable by the same user, which in this product includes an agent, so one of
+    them swapped to a symbolic link after the caller's own read is followed and the removal
+    lands wherever the link points. Neither caller holds the mutation lock across that
+    window, and the checks above them are all by path, so nothing else closed it.
+
+    :func:`kiro_crew.pinned_fs.remove_tree_pinned` is the same mechanism the delete path
+    uses, reached through the same module rather than respelled here: the parent chain is
+    pinned one ``openat`` per component, the batch is opened through it with
+    ``O_NOFOLLOW``, and every removal inside addresses a descriptor whose inode a scan
+    already recorded.
+
+    Pinning is only half of it, and the weaker half. It closes the window after the path is
+    resolved; the swap that lands BEFORE the resolve is followed by ``Path.resolve()``
+    itself, and the pinned walk then reaches the wrong tree correctly - faithfully pinned to
+    a directory that is not this batch. What closes that is
+    :func:`_approve_emptied_batch`, which compares the pinned root against *expect* - an
+    identity the CALLER captured before its own by-path read - and then re-asks through the
+    same descriptor the two questions the callers asked by path.
+
+    *expect* being None means the caller could not read the batch's identity, and the removal
+    is refused: with nothing to bind to, every remaining question would be answered about an
+    unknown directory.
+
+    A refusal LEAVES THE BATCH, and that is the safe direction on both paths: the batch is
+    still listed, so a user can still see it and act. Reporting a success that did not
+    happen is what a bare ``ignore_errors=True`` did. Nothing here writes to the batch on
+    the way out either: every refusal below is evidence about the path, and answering it
+    with a by-path write would be writing through the very redirection it just caught.
+
+    Returns whether the batch is gone.
+    """
+    if not _FD_SAFE_DELETE:
+        # No ``openat``/``O_NOFOLLOW``, so there is no descriptor to bind to and no removal
+        # here that a swapped ancestor cannot redirect. Renaming the batch aside and
+        # verifying it there was the earlier answer and it is not enough: the staging name
+        # sits in a directory an actor can list, so an observed name plus an ancestor
+        # swapped afterwards has ``rmtree`` re-resolve to a same-named tree outside the
+        # trash. The delete path accepts that residual because refusing there would refuse
+        # every empty a user explicitly asked for.
+        #
+        # Neither of these two is user-requested: they are cleanup after work that already
+        # succeeded. So the batch is KEPT, which costs a batch listing zero sessions that
+        # `empty_trash` can still clear on the user's own say-so, and buys never removing a
+        # tree by a name that can be redirected.
+        logger.warning(
+            "keeping trash batch %r: %s cannot be removed safely on this platform, which "
+            "has no way to bind a removal to a descriptor",
+            batch.name,
+            what,
+        )
+        return False
+    try:
+        # Only the PARENT is resolved, and the name is re-joined onto it. `Path.resolve()`
+        # follows the FINAL component too, so a batch directory replaced by a symlink would
+        # resolve to its target and every removal below would run there - deleting from
+        # outside the trash on the strength of a name inside it. Re-joining the name leaves
+        # the last component for the pinned ``O_NOFOLLOW`` open to refuse. This is the same
+        # rule :func:`_approve_batch` follows, for the same reason.
+        resolved = batch.parent.resolve() / batch.name
+    except OSError as exc:
+        logger.warning(
+            "keeping trash batch %r: its location could not be read: %s", batch.name, exc
+        )
+        return False
+
+    def _approve(root_fd: int, tree: pinned_fs.PinnedTree) -> str | None:
+        if expect is None:
+            # Nothing to bind to, so every remaining question would be answered about an
+            # unknown directory.
+            logger.warning("keeping trash batch %r: its identity was never established", batch.name)
+            return SKIP_UNREADABLE
+        opened = os.fstat(root_fd)
+        if (opened.st_dev, opened.st_ino) != expect:
+            logger.warning(
+                "keeping trash batch %r: it is not the directory that was selected", batch.name
+            )
+            return SKIP_IDENTITY_CHANGED
+        return _approve_emptied_batch(batch, root_fd, tree)
+
+    try:
+        outcome = pinned_fs.remove_tree_pinned(
+            str(resolved),
+            what=what,
+            refusal=OSError,
+            approve=_approve,
+            # The manifest goes LAST, and comes back if the batch itself will not go.
+            # `list_trash` omits a batch with no readable manifest, so removing it first and
+            # then failing on the directory would leave a batch holding data that is neither
+            # visible nor restorable - the same reason the delete path moves it aside rather
+            # than unlinking it.
+            keep_until_empty=MANIFEST_NAME,
+        )
+    except OSError as exc:
+        # Includes the ancestor swap the pinned walk exists to catch. Warned rather than
+        # raised: on both paths the caller has already finished the work the user asked for,
+        # and a leftover batch is visible and restorable.
+        logger.warning(
+            "keeping trash batch %r: it could not be removed safely: %s", batch.name, exc
+        )
+        return False
+    if not outcome.removed:
+        logger.warning(
+            "keeping trash batch %r: %s left %d entr(y/ies) behind%s",
+            batch.name,
+            outcome.reason or "the removal",
+            outcome.survivors,
+            f"; part of it is now {outcome.staged_name!r}" if outcome.staged_name else "",
+        )
+    return outcome.removed
 
 
 def _write_header(handle: IO[str], batch_id: str, created_at: float, reason: str) -> None:
@@ -1504,7 +1734,7 @@ def _manifest_records(handle: IO[str], batch: Path) -> Iterator[dict[str, Any]]:
 
 
 def _read_manifest(
-    batch: Path, *, dir_fd: int | None = None
+    batch: Path, *, dir_fd: int | None = None, expect_ino: int | None = None
 ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     """Parse a batch manifest into its header and session entries.
 
@@ -1515,11 +1745,20 @@ def _read_manifest(
     mid-append) is skipped rather than failing the whole batch — every complete
     line before it describes real moved files that must stay restorable (see
     :func:`_manifest_records`).
+
+    *expect_ino* refuses a manifest that is not the file the caller already identified,
+    checked by ``fstat`` on the OPEN handle rather than by a stat of the name - so there is
+    no interval between the check and the read for a replacement to land in. A caller that
+    needs both the header and the listing to describe ONE file passes it and makes a single
+    call: two calls are two opens, and a manifest rewritten between them lets the header
+    check pass on one file while the listing that authorises a deletion comes from another.
     """
     header: dict[str, Any] | None = None
     entries: list[dict[str, Any]] = []
     try:
         with _open_manifest(batch, dir_fd) as handle:
+            if expect_ino is not None and os.fstat(handle.fileno()).st_ino != expect_ino:
+                return None
             for record in _manifest_records(handle, batch):
                 if header is None:
                     header = record
@@ -1790,6 +2029,13 @@ def _move_to_trash_locked(
     batch_id = f"{stamp}-{uuid.uuid4().hex[:8]}"
     target = _batch_dir(batch_id)
     target.mkdir(parents=True, exist_ok=False)
+    # Recorded HERE, at creation and under the mutation lock, because it is the strongest
+    # anchor this path will ever have: the directory was made by this call, so nothing has
+    # had a window to substitute anything for it yet. The cleanup below removes this batch
+    # by descriptor and compares that descriptor against these numbers, so a swapped
+    # ancestor reaching a different directory - however convincingly it is dressed up - is
+    # refused rather than emptied.
+    created_identity = _identity_of(target)
     archives = _archive_index()
 
     moved_bytes = 0
@@ -1933,7 +2179,7 @@ def _move_to_trash_locked(
             raise SessionStorageError(
                 "no sessions were staged, and some files could not be put back; " f"see {target}"
             )
-        shutil.rmtree(target, ignore_errors=True)
+        _remove_emptied_batch(target, "the empty batch", expect=created_identity)
         if revived:
             # A distinct message from "not found": every selected session is still
             # exactly where the caller left it, and it is still resumable. Saying
@@ -2127,10 +2373,16 @@ def _restore_locked(batch_id: str, uids: list[str] | None = None) -> int:
             continue
         restored += 1
 
-    if remaining:
-        _rewrite_manifest(batch, header, remaining)
-    else:
-        _discard_restored_batch(batch, header)
+    # Written EITHER WAY, and before the branch below. Every entry the restore moved back out
+    # has to leave the manifest - a batch that outlives the restore while still listing them
+    # shows the user sessions that are not in it - and this is the point on both paths where
+    # the batch is still just a directory nothing has refused to touch. Doing it after the
+    # removal instead would mean writing to a path whose removal had ALREADY refused, and
+    # `atomic_write` replaces its destination, so the tidying would land wherever a swapped
+    # ancestor now leads.
+    _rewrite_manifest(batch, header, remaining)
+    if not remaining:
+        _discard_restored_batch(batch)
     return restored
 
 
@@ -2263,158 +2515,37 @@ _FD_SAFE_DELETE = (
 _dir_open_flags = pinned_fs.dir_flags
 
 
-def _close_all(fds: Iterable[int]) -> None:
-    """Close every descriptor in *fds*, tolerating one that is already closed.
+#: Descriptor bookkeeping for the pinned walks below, from the same source as the walk
+#: itself. Aliases rather than second copies: a leaked descriptor pins its inode for the
+#: life of the process, and the drain's "pop as you go" rule exists so a failure part-way
+#: cannot leave an already-closed number for a later cleanup to close again.
+_close_all = pinned_fs.close_all
+_drain = pinned_fs.drain_verified_chain
 
-    A close that raises must not abandon the rest: a leaked directory descriptor pins
-    its inode for the life of the process, and this path opens one per staged directory.
-    """
-    for fd in fds:
-        with suppress(OSError):
-            os.close(fd)
-
-
-def _drain(cache: dict[tuple[str, ...], int]) -> None:
-    """Close and forget every descriptor in *cache*.
-
-    Emptied as it goes rather than closed in a loop and cleared afterwards: a failure
-    part-way would otherwise leave already-closed descriptors in the cache for the
-    cleanup below to close a SECOND time, and a reused number makes that second close
-    land on an unrelated file.
-    """
-    while cache:
-        _key, fd = cache.popitem()
-        with suppress(OSError):
-            os.close(fd)
-
-
-def _scan_batch(
-    dir_fd: int,
-    device: int,
-    prefix: tuple[str, ...],
-    dirs: dict[tuple[str, ...], int],
-    files: dict[tuple[str, ...], int],
-    links: dict[tuple[str, ...], int],
-) -> None:
-    """One pinned traversal of a batch: its directories, its files, and its links.
-
-    Records the inode of each directory AND of each non-directory entry, keyed by
-    batch-relative components, plus every LINK's key. Children are opened relative to the
-    descriptor with ``O_NOFOLLOW``, so no path is resolved and a directory that is really a
-    link is not descended into. The inodes come from the directory block itself
-    (``os.DirEntry.inode``), so recording them costs no extra syscall.
-
-    The inodes are the point. ``O_NOFOLLOW`` refuses a LINK, but a real directory RENAMED
-    into a staged name is not a link and satisfies ``O_DIRECTORY`` - so moving a live
-    directory onto a staged directory's name redirected the unlinks at live files that
-    happen to share a staged name, and pinning the batch does not cover that, because the
-    batch's own inode is unchanged by a rename INSIDE it. Every directory the delete later
-    opens must be the inode :func:`staged_targets` recorded while the mutation lock was
-    held. A map read at delete time cannot serve: it reports the impostor.
-
-    ITERATIVE, with an explicit stack, because a recursive walk of a deeply nested tree
-    raises ``RecursionError`` - which is not ``OSError``, so it escaped the callers that
-    turn a failed read into a refusal and reached the dashboard as a snapshot failure. One
-    descriptor is held per level of the CURRENT path, so a tree deep enough still fails,
-    but it fails with ``EMFILE`` - an ``OSError``, which every caller here already treats
-    as "cannot read this batch, keep it".
-
-    Raises rather than returning a short list, for the same reason
-    :func:`_unlisted_files` does: this feeds a decision about deleting the only copy of
-    something, so an incomplete answer must not read as "nothing unaccounted for".
-    """
-    # (key prefix, descriptor, whether this function opened it and must close it)
-    stack: list[tuple[tuple[str, ...], int, bool]] = [(prefix, dir_fd, False)]
-    try:
-        while stack:
-            here, fd, owned = stack.pop()
-            try:
-                with os.scandir(fd) as entries:
-                    listing = list(entries)
-                for entry in listing:
-                    key = here + (entry.name,)
-                    if entry.is_symlink():
-                        links[key] = entry.inode()
-                        continue
-                    if not entry.is_dir(follow_symlinks=False):
-                        files[key] = entry.inode()
-                        continue
-                    child = os.open(entry.name, _dir_open_flags(), dir_fd=fd)
-                    try:
-                        info = os.fstat(child)
-                        if info.st_dev != device:
-                            raise OSError(
-                                f"refusing a staged directory on another device: {entry.name!r}"
-                            )
-                        # The name was listed by `scandir` and opened a moment later, which is
-                        # a check-to-use window like any other - and this one produces the map
-                        # the APPROVAL is made of. A rename in between means the inode recorded
-                        # here belongs to the replacement, so the approval blesses it and the
-                        # delete, validating against that map, removes it. `entry.inode()` is
-                        # what the listing saw; the descriptor is what was opened. They have to
-                        # agree.
-                        if info.st_ino != entry.inode():
-                            raise OSError(
-                                "refusing a staged directory that changed between the listing "
-                                f"and the open: {entry.name!r}"
-                            )
-                    except OSError:
-                        _close_all((child,))
-                        raise
-                    dirs[key] = info.st_ino
-                    stack.append((key, child, True))
-            finally:
-                if owned:
-                    _close_all((fd,))
-    finally:
-        # Whatever is still queued when an error unwinds this: the loop closes each
-        # descriptor as it finishes with it, so only the unvisited remainder is left.
-        _close_all(fd for _key, fd, owned in stack if owned)
+#: The pinned traversal and the verified chain-open used to be spelled here. They are
+#: consumer-agnostic - "walk a tree without ever re-resolving a name" and "open a
+#: component only as the inode a scan recorded" say nothing about batches, manifests or
+#: approval - so they now live in :mod:`kiro_crew.pinned_fs` with the rest of the
+#: mechanism, and what stays in this module is the trash-specific part: which map
+#: authorises the delete, and what a refusal means to the user.
+_scan_tree = pinned_fs.scan_tree_pinned
+_open_chain_verified = pinned_fs.open_verified_chain
 
 
 def _open_chain(
     batch_fd: int,
     parts: tuple[str, ...],
     cache: dict[tuple[str, ...], int],
-    dirs: dict[tuple[str, ...], int],
+    dirs: Mapping[tuple[str, ...], int],
     device: int,
 ) -> int:
-    """Open the directory named by *parts* under a pinned batch, or raise.
+    """Positional-argument wrapper over :func:`kiro_crew.pinned_fs.open_verified_chain`.
 
-    Every component is opened with ``O_NOFOLLOW`` relative to the previous one, so a
-    component that is (or becomes) a link fails the open instead of being followed, and
-    each one is admitted only as the inode :func:`_scan_batch` recorded for that name on
-    the batch's own device. A rename landing after that scan is therefore refused rather
-    than followed - which ``O_NOFOLLOW`` alone cannot do, since a renamed real directory
-    is not a link.
-
-    Descriptors are cached because one batch has a handful of directories and tens of
-    thousands of files inside them, so each directory is verified once and then addressed
-    by the descriptor that was checked.
+    Kept because the delete path threads the same five values through a dozen call sites
+    and reads better without keywords at each one. It adds nothing: no check, no default,
+    no error translation.
     """
-    fd = batch_fd
-    key: tuple[str, ...] = ()
-    for part in parts:
-        key = key + (part,)
-        cached = cache.get(key)
-        if cached is not None:
-            fd = cached
-            continue
-        expected = dirs.get(key)
-        if expected is None:
-            raise OSError(f"refusing a staged directory the batch scan did not see: {part!r}")
-        child = os.open(part, _dir_open_flags(), dir_fd=fd)
-        try:
-            info = os.fstat(child)
-        except OSError:
-            _close_all((child,))
-            raise
-        if (info.st_dev, info.st_ino) != (device, expected):
-            _close_all((child,))
-            raise OSError(f"refusing a staged directory that changed identity: {part!r}")
-        cache[key] = child
-        fd = child
-    return fd
+    return _open_chain_verified(batch_fd, parts, cache=cache, dirs=dirs, device=device)
 
 
 def _plain_parts(rel: str) -> tuple[str, ...] | None:
@@ -2552,11 +2683,11 @@ def _remove_scanned_dirs(
     The removal itself goes through a rename to an unguessable name, because ``rmdir``
     addresses a NAME and so does the check above it: an actor with write access to the
     parent could swap the name between the two and have an unapproved directory removed on
-    another one's approval. Renaming first moves whatever holds the name to somewhere only
-    this call knows, and the identity is re-checked THERE before anything is removed - so a
-    swap that beats the rename gets the intruder's directory moved within its own parent
-    rather than deleted, and is then refused. This is the same technique the manifest and
-    the batch directory already use, for the same reason.
+    another one's approval. That mechanism is
+    :func:`kiro_crew.pinned_fs.remove_dir_verified`, which is where the batch directory and
+    the whole-tree removal get it too - one owner rather than a copy per site. What stays
+    here is the policy: this path logs and CONTINUES, because the post-condition scan below
+    is what decides whether the batch is incomplete.
     """
     for key in sorted(dirs, key=len, reverse=True):
         try:
@@ -2570,103 +2701,64 @@ def _remove_scanned_dirs(
         except OSError as exc:
             logger.warning("could not reach staged directory %r: %s", key[-1], exc)
             continue
-        # Random, like every other staging name here: `os.rename` replaces an existing
-        # destination silently on POSIX, so a predictable name is one that can be squatted.
-        staging = f".{key[-1]}.removing-{uuid.uuid4().hex[:8]}"
-        try:
-            os.rename(key[-1], staging, src_dir_fd=parent, dst_dir_fd=parent)
-        except OSError as exc:
-            logger.warning("could not stage staged directory %r for removal: %s", key[-1], exc)
+        outcome = pinned_fs.remove_dir_verified(
+            parent,
+            key[-1],
+            expect=(device, dirs[key]),
+        )
+        if outcome.removed:
             continue
-        try:
-            moved = os.stat(staging, dir_fd=parent, follow_symlinks=False)
-        except OSError as exc:
-            # NOT restored. What is under the staging name is unknown, so putting it back
-            # means renaming an unknown object onto the listed name - and POSIX rename
-            # REPLACES its destination, which would destroy whatever is there now.
-            logger.warning(
-                "could not re-check staged directory %r; leaving it as %r: %s",
-                key[-1],
-                staging,
-                exc,
-            )
-            continue
-        if not stat.S_ISDIR(moved.st_mode) or (moved.st_dev, moved.st_ino) != (device, dirs[key]):
-            # Also NOT restored, and this is the case that matters: the object under the
-            # staging name is NOT the approved directory, so the listed name is not ours to
-            # write to either. An actor who swapped the directory and then placed something
-            # at the listed name would have had this rename destroy it. It stays under the
-            # unguessable name, logged, and the post-condition reports the batch incomplete.
+        if outcome.reason == pinned_fs.REMOVAL_IDENTITY_CHANGED:
+            # The object under the staging name is NOT the approved directory, so the listed
+            # name is not ours to write to either. An actor who swapped the directory and
+            # then placed something at the listed name would have had a rename-back destroy
+            # it. It stays under the unguessable name, logged, and the post-condition
+            # reports the batch incomplete.
             logger.error(
                 "refusing a staged directory that is not the one that was approved; it is "
                 "now %r and is left there rather than renamed back",
-                staging,
+                outcome.staged_name,
             )
-            continue
-        try:
-            os.rmdir(staging, dir_fd=parent)
-        except OSError as exc:
-            # Restored, and ONLY here: the identity matched, so this IS the approved
-            # directory and the listed name is the one it came from.
-            logger.warning("could not remove staged directory %r: %s", key[-1], exc)
-            _restore_staged_dir(parent, staging, key[-1])
+        elif outcome.reason == pinned_fs.REMOVAL_UNVERIFIABLE:
+            # Also not put back: what is under the staging name is unknown, so renaming it
+            # onto the listed name would replace whatever is there now.
+            logger.warning(
+                "could not re-check staged directory %r; leaving it as %r: %s",
+                key[-1],
+                outcome.staged_name,
+                outcome.error,
+            )
+        elif outcome.reason == pinned_fs.REMOVAL_STAGE_FAILED:
+            logger.warning(
+                "could not stage staged directory %r for removal: %s", key[-1], outcome.error
+            )
+        else:
+            logger.warning("could not remove staged directory %r: %s", key[-1], outcome.error)
+            if outcome.staged_name is not None:
+                # The identity matched, so this IS the approved directory - but it could not
+                # be put back, and a directory under a staging name is one nothing
+                # recognises.
+                logger.error(
+                    "staged directory %r is now %r and could not be put back",
+                    key[-1],
+                    outcome.staged_name,
+                )
 
 
-def _copy_back_exclusive(parent_fd: int, batch_fd: int, debris: str, name: str) -> bool:
-    """Recreate *name* inside *batch_fd* from *debris*, refusing to replace anything.
+def _unlink_debris(parent_fd: int, debris: str, expect_ino: int | None) -> None:
+    """Unlink the moved-aside manifest, only while that name still holds it.
 
-    The recovery's first choice is `os.link`, which cannot clobber. Where hard links are
-    unsupported there is no second no-clobber RENAME in the stdlib -- `renameat2`'s
-    `RENAME_NOREPLACE` is Linux-only and unexposed -- and the two obvious substitutes are
-    each a documented loss:
-
-    * `rename` after checking the name is free puts a check-to-use window between the look
-      and the act, so a file arriving in between is replaced. That is the same
-      trusted-a-name mistake this whole path exists to remove.
-    * giving up leaves the batch holding data with no manifest, which `list_trash()` omits:
-      unlistable and unrestorable.
-
-    `O_CREAT | O_EXCL` is the third option and has neither flaw. The create either wins or
-    fails with EEXIST, decided inside one syscall, so nothing can arrive in a window; and it
-    needs no hard-link support, so it strands nothing. The cost is a copy rather than a link,
-    paid only on a filesystem without links and only when a batch already failed to empty.
-
-    Returns True when the manifest is back.
+    The debris name lives in the trash root, and by the time this runs the batch removal has
+    either succeeded or failed - so time has passed in a directory an actor may be able to
+    write to. Unlinking by name alone would destroy whatever answers to it by then, which is
+    the same trusted-a-name mistake every other removal on this path was rewritten to avoid.
+    Best effort: a name that no longer holds the manifest is left alone, not chased.
     """
-    try:
-        src = os.open(debris, os.O_RDONLY, dir_fd=parent_fd)
-    except OSError:
-        return False
-    try:
-        try:
-            dst = os.open(
-                name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-                dir_fd=batch_fd,
-            )
-        except OSError:
-            # EEXIST is the case worth naming: something holds the name, so the batch is
-            # listable through it and nothing here may overwrite it.
-            return False
-        try:
-            while True:
-                chunk = os.read(src, 1 << 20)
-                if not chunk:
-                    break
-                while chunk:
-                    chunk = chunk[os.write(dst, chunk) :]
-        except OSError:
-            # A half-written manifest is worse than none: it would list SOME sessions and
-            # silently drop the rest. Remove it and report the failure instead.
-            with suppress(OSError):
-                os.unlink(name, dir_fd=batch_fd)
-            return False
-        finally:
-            os.close(dst)
-    finally:
-        os.close(src)
-    return True
+    if expect_ino is None:
+        return
+    with suppress(OSError):
+        if os.stat(debris, dir_fd=parent_fd, follow_symlinks=False).st_ino == expect_ino:
+            os.unlink(debris, dir_fd=parent_fd)
 
 
 def _inode_of(name: str, dir_fd: int) -> int | None:
@@ -2691,22 +2783,26 @@ def _remove_pinned_batch(parent_fd: int, batch_fd: int, name: str) -> None:
     left holding data with nothing to list it, while the caller reported success.
 
     So the name is moved to one nothing can predict, its identity is checked against the
-    descriptor the whole operation was pinned to, and only that name is removed. Raising
-    rather than reporting lets the caller's existing recovery run unchanged: it renames the
-    manifest back through ``batch_fd``, so it lands in the REAL batch and the batch stays
-    listed and restorable.
+    descriptor the whole operation was pinned to, and only that name is removed - by
+    :func:`kiro_crew.pinned_fs.remove_dir_verified`, the same primitive the interior
+    directories use. Raising rather than reporting lets the caller's existing recovery run
+    unchanged: it renames the manifest back through ``batch_fd``, so it lands in the REAL
+    batch and the batch stays listed and restorable.
     """
     expected = os.fstat(batch_fd)
-    staging = f".{name}.removing-{uuid.uuid4().hex[:8]}"
-    os.rename(name, staging, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-    moved = None
-    with suppress(OSError):
-        moved = os.stat(staging, dir_fd=parent_fd, follow_symlinks=False)
-    if (
-        moved is None
-        or not stat.S_ISDIR(moved.st_mode)
-        or (moved.st_dev, moved.st_ino) != (expected.st_dev, expected.st_ino)
-    ):
+    outcome = pinned_fs.remove_dir_verified(
+        parent_fd,
+        name,
+        expect=(expected.st_dev, expected.st_ino),
+    )
+    if outcome.removed:
+        return
+    if outcome.reason == pinned_fs.REMOVAL_STAGE_FAILED:
+        # Nothing was moved, so there is nothing to report about a staging name. Raised as
+        # the OSError the rename itself produced, which is what this function's callers
+        # already handle.
+        raise outcome.error or OSError(f"could not stage the batch for removal: {name!r}")
+    if outcome.reason in (pinned_fs.REMOVAL_IDENTITY_CHANGED, pinned_fs.REMOVAL_UNVERIFIABLE):
         # NOT renamed back. Whatever is under the staging name is not the pinned batch, so
         # the batch's name is not ours to write to either - and POSIX rename REPLACES its
         # destination, so putting this back would destroy whatever now answers to that name.
@@ -2714,31 +2810,16 @@ def _remove_pinned_batch(parent_fd: int, batch_fd: int, name: str) -> None:
         logger.error(
             "the batch name no longer denotes the pinned batch; what was there is now %r "
             "in the trash root and is left there rather than renamed back",
-            staging,
+            outcome.staged_name,
         )
         raise OSError(f"the batch name no longer denotes the pinned batch: {name!r}")
-    try:
-        os.rmdir(staging, dir_fd=parent_fd)
-    except OSError:
-        # Renamed back, and only here: the identity matched, so this IS the pinned batch and
-        # the name it came from is its own.
-        _restore_staged_dir(parent_fd, staging, name)
-        raise
-
-
-def _restore_staged_dir(parent: int, staging: str, name: str) -> None:
-    """Put a directory staged for removal back under the name the batch listed.
-
-    Without this a refusal would leave the directory under a name nothing recognises,
-    which is worse than the swap it refused: the post-condition scan reports the batch
-    incomplete either way, but only one of the two leaves the user something they can
-    identify.
-    """
-    try:
-        os.rename(staging, name, src_dir_fd=parent, dst_dir_fd=parent)
-    except OSError:
-        # Logged loudly with the staging name, which is what a human needs to undo it.
-        logger.error("staged directory %r is now %r and could not be put back", name, staging)
+    if outcome.staged_name is not None:
+        # The identity matched, so this IS the pinned batch - but the rmdir failed AND it
+        # could not be renamed back, so it is now under a name `list_trash` does not offer.
+        logger.error(
+            "staged directory %r is now %r and could not be put back", name, outcome.staged_name
+        )
+    raise outcome.error or OSError(f"could not remove the batch directory: {name!r}")
 
 
 def _rename_back(staging: Path, batch: Path) -> None:
@@ -2882,9 +2963,11 @@ def _delete_listed_files(
         # characters, so re-targeting it means guessing it.
         #
         # NOT airtight, and better said than implied: `rmtree` still resolves the staging
-        # path, so a caller that can guess the name inside that window can still redirect
-        # it. Failing closed instead would refuse every empty on this platform, which is a
-        # worse answer than a window an attacker has to guess their way into.
+        # path, so a caller that can OBSERVE that name inside the window can still redirect
+        # it through an ancestor swapped afterwards. It is accepted HERE and only here,
+        # because failing closed would refuse every empty a user explicitly asked for on
+        # this platform. The two cleanup paths in `_remove_emptied_batch` make the opposite
+        # trade for the same residual: nobody asked for those, so they keep the batch.
         staging = batch.parent / f".{batch.name}.removing-{uuid.uuid4().hex[:8]}"
         try:
             os.rename(batch, staging)
@@ -2962,10 +3045,11 @@ def _delete_listed_files(
             present: dict[tuple[str, ...], int] = {}
             links: dict[tuple[str, ...], int] = {}
             try:
-                _scan_batch(batch_fd, device, (), dirs, present, links)
+                scanned = _scan_tree(batch_fd, device=device)
             except OSError as exc:
                 logger.warning("refusing to empty %r: %s", batch.name, exc)
                 return 0, SKIP_UNREADABLE
+            dirs, present, links = scanned.dirs, scanned.files, scanned.links
             # The interior has to match the APPROVAL, not merely be self-consistent. A map
             # built here records whatever is present by now - a directory swapped in during
             # the handoff included - so it cannot be the thing that authorises the delete.
@@ -3140,11 +3224,12 @@ def _delete_listed_files(
             left_files: dict[tuple[str, ...], int] = {}
             left_links: dict[tuple[str, ...], int] = {}
             try:
-                _scan_batch(batch_fd, device, (), left_dirs, left_files, left_links)
+                left = _scan_tree(batch_fd, device=device)
             except OSError as exc:
                 logger.warning("emptying %r: could not confirm it is empty: %s", batch.name, exc)
                 cleared = False
             else:
+                left_dirs, left_files, left_links = left.dirs, left.files, left.links
                 # By INODE, not by name. Everything after this point treats the survivor as
                 # the batch's own manifest: it is renamed aside and, once the batch is gone,
                 # the debris is unlinked. So a file substituted at that name after the first
@@ -3219,27 +3304,40 @@ def _delete_listed_files(
                         logger.warning("emptying %r did not remove it: %s", batch.name, exc)
                         cleared = False
                         restored = False
-                        try:
-                            # `link`, not `rename`: POSIX rename REPLACES its destination
-                            # silently, which is the property the debris name above is
-                            # chosen to be safe against - and this direction needs the
-                            # opposite guarantee. If anything has created a
-                            # `manifest.jsonl` in the batch since ours was moved aside,
-                            # renaming over it would destroy the only copy of a file this
-                            # code has never read. `link` fails with EEXIST instead, and
-                            # the debris is unlinked only once the batch has its manifest
-                            # back, so no window has neither.
-                            os.link(
+                        # `landed` equalled this inode above, which is what let this branch be
+                        # reached at all. Bound to a local, and the recovery skipped outright
+                        # if it is unknown: without an identity to check, the debris name is
+                        # just a name in a directory an actor may be able to write to.
+                        debris_ino = present.get((MANIFEST_NAME,))
+                        # Never `rename`: POSIX rename REPLACES its destination silently,
+                        # which is the property the debris name above is chosen to be safe
+                        # against - and this direction needs the opposite guarantee. If
+                        # anything has created a `manifest.jsonl` in the batch since ours
+                        # was moved aside, renaming over it would destroy the only copy of a
+                        # file this code has never read.
+                        #
+                        # `pinned_fs.put_back_no_clobber` owns that: the debris name is opened
+                        # `O_NOFOLLOW` and checked against `debris_ino` before anything is read
+                        # from it, `os.link` first because it cannot clobber, and an
+                        # `O_CREAT | O_EXCL` create-and-copy where the MOUNT has no hard links
+                        # - which the `os.supports_dir_fd` probe cannot see, since it tests
+                        # what the OS accepts and not what the filesystem does. The debris is
+                        # unlinked only once the batch has its manifest back, so no window has
+                        # neither.
+                        back: str | None = pinned_fs.PUT_BACK_FAILED
+                        if debris_ino is not None:
+                            back = pinned_fs.put_back_no_clobber(
+                                parent_fd,
+                                batch_fd,
                                 debris,
                                 MANIFEST_NAME,
-                                src_dir_fd=parent_fd,
-                                dst_dir_fd=batch_fd,
+                                expect_ino=debris_ino,
                             )
-                            restored = True
-                        except FileExistsError:
+                        restored = back is None
+                        if back == pinned_fs.PUT_BACK_NAME_TAKEN:
                             # Something arrived at the name. NOT overwritten - that is the
-                            # whole reason this is a link - and the batch is still listable,
-                            # because whatever arrived is a manifest by name and
+                            # whole reason this is not a rename - and the batch is still
+                            # listable, because whatever arrived is a manifest by name and
                             # `list_trash()` can read it. The debris stays for a human.
                             logger.error(
                                 "emptying %r could not restore its manifest because another "
@@ -3248,36 +3346,17 @@ def _delete_listed_files(
                                 batch.name,
                                 debris,
                             )
-                        except OSError as exc:
-                            # `link` is not universally available: a filesystem without hard
-                            # links refuses it, and the capability probe cannot see that -
-                            # it tests whether the OS accepts `dir_fd`, not what the MOUNT
-                            # supports. Giving up here would strand the batch with no
-                            # manifest while its data survived, which is the exact loss this
-                            # recovery exists to prevent.
-                            #
-                            # The fallback is an EXCLUSIVE create and a copy, not a rename
-                            # after checking the name is free: that check-to-use pair leaves
-                            # a window an arriving file loses in, which is the mistake this
-                            # module spent every other guard removing. `O_CREAT | O_EXCL`
-                            # decides in one syscall, so there is no window to lose.
-                            restored = _copy_back_exclusive(
-                                parent_fd, batch_fd, debris, MANIFEST_NAME
+                        elif not restored:
+                            logger.error(
+                                "emptying %r removed neither the batch nor its manifest; "
+                                "the manifest is now %r in the trash root",
+                                batch.name,
+                                debris,
                             )
-                            if not restored:
-                                logger.error(
-                                    "emptying %r removed neither the batch nor its manifest; "
-                                    "the manifest is now %r in the trash root: %s",
-                                    batch.name,
-                                    debris,
-                                    exc,
-                                )
                         if restored:
-                            with suppress(OSError):
-                                os.unlink(debris, dir_fd=parent_fd)
+                            _unlink_debris(parent_fd, debris, debris_ino)
                     else:
-                        with suppress(OSError):
-                            os.unlink(debris, dir_fd=parent_fd)
+                        _unlink_debris(parent_fd, debris, present.get((MANIFEST_NAME,)))
                         freed += manifest_bytes
         finally:
             _drain(cache)
@@ -3402,10 +3481,8 @@ def _approve_batch(path: Path) -> tuple[BatchIdentity, int] | None:
         # it first also fails closed: a rewrite after this point leaves the digest
         # describing the old listing, so the delete refuses.
         digest = _rels_digest(_manifest_rels(path, dir_fd=batch_fd))
-        dirs: dict[tuple[str, ...], int] = {}
-        files: dict[tuple[str, ...], int] = {}
-        links: dict[tuple[str, ...], int] = {}
-        _scan_batch(batch_fd, info.st_dev, (), dirs, files, links)
+        scanned = _scan_tree(batch_fd, device=info.st_dev)
+        dirs, files, links = scanned.dirs, scanned.files, scanned.links
         summary = _summarize_manifest(path, dir_fd=batch_fd)
     except OSError:
         return None
